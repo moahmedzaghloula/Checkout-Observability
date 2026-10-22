@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "checkout-observability"
+version = "0.1.0"
+description = "A small two-service checkout system for observability exercises."
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  "fastapi==0.140.10",
+  "httpx==0.28.1",
+  "uvicorn==0.53.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["services*", "shared*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers -p no:cacheprovider"
+testpaths = ["tests"]
