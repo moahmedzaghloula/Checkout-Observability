@@ -7,6 +7,7 @@ Checkout Observability is a small Python service pair designed as a practical fo
 - `checkout-api` exposes `GET /health` and `POST /checkout` on port `8000`.
 - `inventory-api` exposes `GET /health` and `POST /check` on port `8001`.
 - The checkout service uses one lifespan-managed asynchronous HTTP client to call the inventory service.
+- `checkout-api` exports manual checkout spans over OTLP/HTTP to an OpenTelemetry Collector, which batches and forwards them to Jaeger over OTLP/gRPC.
 - Both APIs return a consistent success or error envelope and publish interactive OpenAPI documentation at `/docs`.
 
 ## Requirements
@@ -16,13 +17,13 @@ Checkout Observability is a small Python service pair designed as a practical fo
 
 ## Containerized local development
 
-Build the images and wait for both services to become healthy:
+Build the images and wait for all services to become healthy:
 
 ```bash
 docker compose up --build --wait
 ```
 
-Only `checkout-api` is published to the host at `127.0.0.1:8000`. The `inventory-api` port is available only inside the Compose network, where checkout reaches it through the `inventory-api` service name.
+Only `checkout-api` and the Jaeger UI are published to the host, at `127.0.0.1:8000` and `http://127.0.0.1:16686` respectively. Inventory and both OTLP ports remain internal to the Compose network. The checkout service reaches them through the `inventory-api` and `otel-collector` Compose service names.
 
 Submit a checkout:
 
@@ -38,7 +39,13 @@ Stop and remove only this Compose application's containers and networks:
 docker compose down
 ```
 
-The Compose configuration is intended for local development and explicitly enables the `slow` and `error` simulations with `APP_ENV=local`. It uses no bind mounts, so Fedora SELinux relabeling is not required.
+The Compose configuration is intended for local development and explicitly enables the `slow` and `error` simulations with `APP_ENV=local`. The Collector configuration is mounted read-only with the private `Z` SELinux label required by the Fedora target. Local telemetry hops use plaintext inside the isolated Compose network. Jaeger uses transient in-memory storage, so traces are lost when its container stops; this setup is not a production security or durability design.
+
+## Tracing
+
+Each valid checkout request creates a manual `checkout.process` span. The trace resource identifies `service.name`, `service.version`, and `deployment.environment.name`; span attributes are bounded and exclude request bodies, product IDs, headers, and credentials. Metrics and OpenTelemetry log export are not configured.
+
+Use the Jaeger UI at `http://127.0.0.1:16686` and select `checkout-api` after submitting a checkout. The local stack pins OpenTelemetry Collector `0.162.0` and Jaeger `2.22.0` by version and image digest. Python tracing packages are pinned at `1.45.1` in the dependency lock files.
 
 ## Native Python development
 
@@ -66,6 +73,7 @@ Supported scenarios are `normal`, `slow`, `error`, and `out-of-stock`. The `slow
 | `APP_ENV` | `development` | Runtime environment; must be `local` for simulations. |
 | `INVENTORY_API_URL` | `http://127.0.0.1:8001` | Inventory service base URL used by checkout. |
 | `INVENTORY_HTTP_TIMEOUT_SECONDS` | `2.0` | Checkout-to-inventory HTTP timeout. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | Full OTLP/HTTP endpoint used by checkout for spans. |
 | `ENABLE_LOCAL_SIMULATIONS` | `false` | Enables slow and error scenarios only when `APP_ENV=local`. |
 | `SIMULATED_DELAY_SECONDS` | `1.0` | Delay applied to the local slow scenario. |
 
@@ -83,4 +91,4 @@ Supported scenarios are `normal`, `slow`, `error`, and `out-of-stock`. The `slow
 .venv/bin/python -m pytest
 ```
 
-The tests exercise validation, deterministic inventory behavior, local-only simulations, service-to-service calls, error mapping, timeout handling, and HTTP client shutdown.
+The tests exercise validation, deterministic inventory behavior, local-only simulations, service-to-service calls, error mapping, timeout handling, HTTP client shutdown, telemetry lifecycle, and span metadata.

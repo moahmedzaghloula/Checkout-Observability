@@ -60,6 +60,18 @@ jobs:
             --header 'content-type: application/json' \
             --data '{"product_id":"SKU-001","quantity":2,"scenario":"normal"}'
 
+      - name: Verify trace reached Jaeger
+        run: |
+          for attempt in $(seq 1 15); do
+            services="$(curl --fail --silent --show-error http://127.0.0.1:16686/api/v3/services)"
+            if printf '%s' "$services" | grep --quiet 'checkout-api'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          printf '%s\n' 'checkout-api did not appear in Jaeger within 15 seconds'
+          exit 1
+
       - name: Stop services
         if: always()
         run: docker compose down --remove-orphans

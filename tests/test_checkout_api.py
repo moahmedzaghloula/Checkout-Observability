@@ -2,9 +2,16 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 import httpx
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
+from opentelemetry.trace import StatusCode
 import pytest
 
 from services.checkout_api.main import create_app as create_checkout_app
+from services.checkout_api.telemetry import TelemetryRuntime, build_resource
 from services.inventory_api.main import create_app as create_inventory_app
 from shared.config import Settings
 
@@ -36,10 +43,14 @@ def inventory_client_factory(
 async def checkout_client(
     settings: Settings | None = None,
     factory: Callable[[Settings], httpx.AsyncClient] | None = None,
+    telemetry: TelemetryRuntime | None = None,
 ) -> AsyncIterator[httpx.AsyncClient]:
+    runtime_settings = settings or Settings()
+    telemetry_runtime = telemetry or make_test_telemetry(runtime_settings)[0]
     app = create_checkout_app(
-        settings or Settings(),
+        runtime_settings,
         http_client_factory=factory or inventory_client_factory(),
+        telemetry_factory=lambda _settings: telemetry_runtime,
     )
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -47,6 +58,21 @@ async def checkout_client(
             base_url="http://checkout.test",
         ) as client:
             yield client
+
+
+def make_test_telemetry(
+    settings: Settings,
+) -> tuple[TelemetryRuntime, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(resource=build_resource(settings))
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return (
+        TelemetryRuntime(
+            provider=provider,
+            tracer=provider.get_tracer("checkout-api.tests", "0.1.0"),
+        ),
+        exporter,
+    )
 
 
 async def test_health_reports_service_name() -> None:
@@ -71,6 +97,49 @@ async def test_checkout_accepts_available_product() -> None:
             "quantity": 2,
         },
     }
+
+
+async def test_checkout_creates_bounded_process_span() -> None:
+    settings = Settings(app_env="test")
+    telemetry, exporter = make_test_telemetry(settings)
+
+    async with checkout_client(settings=settings, telemetry=telemetry) as client:
+        response = await client.post("/checkout", json=CHECKOUT_REQUEST)
+
+    spans = exporter.get_finished_spans()
+    assert response.status_code == 200
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.name == "checkout.process"
+    assert span.resource.attributes["service.name"] == "checkout-api"
+    assert span.resource.attributes["service.version"] == "0.1.0"
+    assert span.resource.attributes["deployment.environment.name"] == "test"
+    assert span.attributes == {
+        "checkout.quantity": 2,
+        "checkout.scenario": "normal",
+        "checkout.inventory.status_code": 200,
+        "checkout.inventory.available": True,
+        "checkout.outcome": "accepted",
+        "checkout.response.status_code": 200,
+    }
+
+
+async def test_checkout_marks_dependency_failures_as_span_errors() -> None:
+    settings = Settings(app_env="local", enable_local_simulations=True)
+    telemetry, exporter = make_test_telemetry(settings)
+    request = {**CHECKOUT_REQUEST, "scenario": "error"}
+
+    async with checkout_client(
+        settings=settings,
+        factory=inventory_client_factory(settings),
+        telemetry=telemetry,
+    ) as client:
+        response = await client.post("/checkout", json=request)
+
+    span = exporter.get_finished_spans()[0]
+    assert response.status_code == 503
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.attributes["checkout.outcome"] == "inventory_unavailable"
 
 
 async def test_checkout_returns_conflict_when_product_is_unavailable() -> None:
@@ -124,3 +193,12 @@ async def test_checkout_closes_inventory_client_on_shutdown() -> None:
         assert created_clients[0].is_closed is False
 
     assert created_clients[0].is_closed is True
+
+
+async def test_checkout_shuts_down_telemetry() -> None:
+    telemetry, _exporter = make_test_telemetry(Settings())
+
+    async with checkout_client(telemetry=telemetry):
+        assert telemetry._is_shutdown is False
+
+    assert telemetry._is_shutdown is True

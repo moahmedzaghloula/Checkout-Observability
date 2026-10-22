@@ -39,15 +39,15 @@ def _read_positive_float(name: str, default: float) -> float:
     return value
 
 
-def _validate_service_url(value: str) -> str:
+def _validate_http_url(name: str, value: str, *, strip_trailing_slash: bool) -> str:
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("INVENTORY_API_URL must be an absolute HTTP(S) URL")
+        raise ValueError(f"{name} must be an absolute HTTP(S) URL")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError(
-            "INVENTORY_API_URL must not contain credentials, a query, or a fragment"
+            f"{name} must not contain credentials, a query, or a fragment"
         )
-    return value.rstrip("/")
+    return value.rstrip("/") if strip_trailing_slash else value
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +57,7 @@ class Settings:
     app_env: str = "development"
     inventory_api_url: str = "http://127.0.0.1:8001"
     inventory_http_timeout_seconds: float = 2.0
+    otel_traces_endpoint: str = "http://127.0.0.1:4318/v1/traces"
     enable_local_simulations: bool = False
     simulated_delay_seconds: float = 1.0
 
@@ -66,7 +67,20 @@ class Settings:
         object.__setattr__(
             self,
             "inventory_api_url",
-            _validate_service_url(self.inventory_api_url.strip()),
+            _validate_http_url(
+                "INVENTORY_API_URL",
+                self.inventory_api_url.strip(),
+                strip_trailing_slash=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "otel_traces_endpoint",
+            _validate_http_url(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                self.otel_traces_endpoint.strip(),
+                strip_trailing_slash=False,
+            ),
         )
 
         if self.inventory_http_timeout_seconds <= 0:
@@ -89,6 +103,10 @@ class Settings:
             ),
             inventory_http_timeout_seconds=_read_positive_float(
                 "INVENTORY_HTTP_TIMEOUT_SECONDS", 2.0
+            ),
+            otel_traces_endpoint=os.getenv(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://127.0.0.1:4318/v1/traces",
             ),
             enable_local_simulations=_read_bool(
                 "ENABLE_LOCAL_SIMULATIONS", False

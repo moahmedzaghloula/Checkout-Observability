@@ -1,0 +1,43 @@
+from opentelemetry.sdk.trace.export import SpanExportResult
+
+from services.checkout_api import telemetry
+from shared.config import Settings
+
+
+class StubExporter:
+    def export(self, spans):
+        return SpanExportResult.SUCCESS
+
+    def force_flush(self, timeout_millis=30_000):
+        return True
+
+    def shutdown(self):
+        return None
+
+
+def test_initialize_telemetry_creates_one_provider_per_process(monkeypatch) -> None:
+    registered_providers = []
+    monkeypatch.setattr(telemetry, "_runtime", None)
+    monkeypatch.setattr(telemetry, "OTLPSpanExporter", lambda **_kwargs: StubExporter())
+    monkeypatch.setattr(
+        telemetry.trace,
+        "set_tracer_provider",
+        registered_providers.append,
+    )
+
+    first = telemetry.initialize_telemetry(Settings(app_env="test"))
+    second = telemetry.initialize_telemetry(Settings(app_env="different"))
+
+    assert first is second
+    assert registered_providers == [first.provider]
+    assert first.provider.resource.attributes["service.name"] == "checkout-api"
+    assert first.provider.resource.attributes["service.version"] == "0.1.0"
+    assert first.provider.resource.attributes["deployment.environment.name"] == "test"
+    first.shutdown()
+
+
+def test_settings_reads_explicit_trace_endpoint(monkeypatch) -> None:
+    endpoint = "http://collector.test:4318/v1/traces"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", endpoint)
+
+    assert Settings.from_env().otel_traces_endpoint == endpoint
