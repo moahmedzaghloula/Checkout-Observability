@@ -35,3 +35,31 @@ jobs:
 
       - name: Run tests
         run: python -m pytest
+
+  container-smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start services
+        run: docker compose up --detach --wait --wait-timeout 60
+
+      - name: Exercise checkout path
+        run: |
+          curl --fail-with-body \
+            --request POST http://127.0.0.1:8000/checkout \
+            --header 'content-type: application/json' \
+            --data '{"product_id":"SKU-001","quantity":2,"scenario":"normal"}'
+
+      - name: Stop services
+        if: always()
+        run: docker compose down --remove-orphans

@@ -12,8 +12,35 @@ Checkout Observability is a small Python service pair designed as a practical fo
 ## Requirements
 
 - Python 3.11 through 3.14; Python 3.13 is used by CI and the lock file.
+- Docker Engine with Docker Compose v2 for the containerized local environment.
 
-## Setup
+## Containerized local development
+
+Build the images and wait for both services to become healthy:
+
+```bash
+docker compose up --build --wait
+```
+
+Only `checkout-api` is published to the host at `127.0.0.1:8000`. The `inventory-api` port is available only inside the Compose network, where checkout reaches it through the `inventory-api` service name.
+
+Submit a checkout:
+
+```bash
+curl --request POST http://127.0.0.1:8000/checkout \
+  --header 'content-type: application/json' \
+  --data '{"product_id":"SKU-001","quantity":2,"scenario":"normal"}'
+```
+
+Stop and remove only this Compose application's containers and networks:
+
+```bash
+docker compose down
+```
+
+The Compose configuration is intended for local development and explicitly enables the `slow` and `error` simulations with `APP_ENV=local`. It uses no bind mounts, so Fedora SELinux relabeling is not required.
+
+## Native Python development
 
 ```bash
 python3 -m venv .venv
@@ -28,14 +55,6 @@ Run each service from the repository root in a separate terminal:
 
 ```bash
 .venv/bin/python -m uvicorn services.checkout_api.main:app --port 8000
-```
-
-Submit a checkout:
-
-```bash
-curl --request POST http://127.0.0.1:8000/checkout \
-  --header 'content-type: application/json' \
-  --data '{"product_id":"SKU-001","quantity":2,"scenario":"normal"}'
 ```
 
 Supported scenarios are `normal`, `slow`, `error`, and `out-of-stock`. The `slow` and `error` scenarios are deliberately unavailable by default. To use them locally, start both services with `APP_ENV=local` and `ENABLE_LOCAL_SIMULATIONS=true`. Never enable simulated failures in a shared environment.

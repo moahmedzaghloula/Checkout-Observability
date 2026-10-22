@@ -1,0 +1,14 @@
+**
+!requirements.runtime.lock
+!shared/
+!shared/**
+!services/
+!services/__init__.py
+!services/inventory_api/
+!services/inventory_api/**
+**/__pycache__/
+**/*.py[cod]
+**/.env*
+**/*.pem
+**/*.key
+**/*.crt

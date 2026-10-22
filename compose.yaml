@@ -1,0 +1,84 @@
+name: checkout-observability
+
+services:
+  inventory-api:
+    build:
+      context: .
+      dockerfile: services/inventory_api/Dockerfile
+    environment:
+      APP_ENV: local
+      ENABLE_LOCAL_SIMULATIONS: "true"
+      SIMULATED_DELAY_SECONDS: "1.0"
+    expose:
+      - "8001"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2).close()
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
+    networks:
+      - service-network
+
+  checkout-api:
+    build:
+      context: .
+      dockerfile: services/checkout_api/Dockerfile
+    depends_on:
+      inventory-api:
+        condition: service_healthy
+    environment:
+      APP_ENV: local
+      ENABLE_LOCAL_SIMULATIONS: "true"
+      INVENTORY_API_URL: http://inventory-api:8001
+      INVENTORY_HTTP_TIMEOUT_SECONDS: "2.0"
+    ports:
+      - target: 8000
+        published: "8000"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
+    networks:
+      - service-network
+      - edge-network
+
+networks:
+  service-network:
+    internal: true
+  edge-network:
+    driver: bridge
