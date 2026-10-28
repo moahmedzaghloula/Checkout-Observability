@@ -1,4 +1,5 @@
 from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult
+from opentelemetry.sdk.trace.sampling import ParentBased
 from opentelemetry.sdk.trace.export import SpanExportResult
 import pytest
 
@@ -76,3 +77,29 @@ def test_settings_reads_explicit_metrics_endpoint(monkeypatch) -> None:
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", endpoint)
 
     assert Settings.from_env().otel_metrics_endpoint == endpoint
+
+
+def test_trace_provider_reads_parent_based_ratio_sampler_from_environment(
+    monkeypatch,
+) -> None:
+    registered_providers = []
+    monkeypatch.setattr(telemetry, "_runtime", None)
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER", "parentbased_traceidratio")
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", "0.25")
+    monkeypatch.setattr(telemetry, "OTLPSpanExporter", lambda **_kwargs: StubExporter())
+    monkeypatch.setattr(
+        telemetry, "OTLPMetricExporter", lambda **_kwargs: StubMetricExporter()
+    )
+    monkeypatch.setattr(
+        telemetry.trace,
+        "set_tracer_provider",
+        registered_providers.append,
+    )
+    monkeypatch.setattr(telemetry.metrics, "set_meter_provider", lambda _provider: None)
+
+    runtime = telemetry.initialize_telemetry(Settings(app_env="test"), "checkout-api")
+
+    assert isinstance(runtime.provider.sampler, ParentBased)
+    assert "TraceIdRatioBased{0.25}" in runtime.provider.sampler.get_description()
+    assert registered_providers == [runtime.provider]
+    runtime.shutdown()

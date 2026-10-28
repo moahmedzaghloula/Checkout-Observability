@@ -61,6 +61,22 @@ Each service uses a distinct `service.name` with the same `service.version` and 
 
 Use the Jaeger UI at `http://127.0.0.1:16686` and select `checkout-api` after submitting a checkout. The local stack pins OpenTelemetry Collector `0.162.0` and Jaeger `2.22.0` by version and image digest. Python tracing packages are pinned at `1.45.1`; FastAPI and httpx instrumentation packages are pinned at `0.66b1`.
 
+Full trace capture is the local default:
+
+```bash
+OTEL_TRACES_SAMPLER=always_on
+```
+
+Parent-aware ratio-based head sampling can be selected before recreating both application services:
+
+```bash
+OTEL_TRACES_SAMPLER=parentbased_traceidratio \
+OTEL_TRACES_SAMPLER_ARG=0.25 \
+docker compose up --detach --force-recreate --wait inventory-api checkout-api
+```
+
+The root checkout decision is propagated to inventory through W3C Trace Context. Trace sampling does not change the custom checkout counter or histogram.
+
 ## Metrics and dashboard
 
 The checkout service records `checkout.requests` as a counter and `checkout.request.duration` as an explicit-bucket histogram measured in seconds. A request is included exactly once only after FastAPI validation succeeds and the `/checkout` handler starts; validation responses produced before the handler, including `422`, are excluded. Every included outcome is counted and timed. Only `accepted` has `result="success"`; out of stock, inventory rejection, missing products, invalid upstream responses, timeouts, connection failures, and upstream errors have `result="error"`.
@@ -80,6 +96,50 @@ The Prometheus exporter in Collector `0.162.0` is a beta metrics component. Dash
 Both applications use Python logging to emit one-line JSON events to standard output. Each event includes an RFC 3339 timestamp, severity, service identity, bounded outcome fields, duration in seconds, and the active OpenTelemetry trace and span IDs. Records emitted outside an active span contain null correlation IDs, preventing context from leaking between requests. Request bodies, authorization headers, credentials, and environment dumps are not logged.
 
 Use `docker compose logs checkout-api` or `docker compose logs inventory-api` for local inspection. A log's `trace_id` can be pasted into Jaeger to locate the connected trace. These correlated stdout records are not an OTLP logs pipeline and are not durable log storage; no Loki or other log backend is included.
+
+## Reproducible verification
+
+Generate a finite local traffic mix. The target is mandatory and restricted to loopback addresses:
+
+```bash
+.venv/bin/python scripts/traffic.py \
+  --target-url http://127.0.0.1:8000
+```
+
+The default run sends 20 requests with bounded concurrency and includes normal, slow, simulated failure, and out-of-stock scenarios. It reports response counts and latency summaries; it is not a benchmark or a production load test.
+
+Verify health, response contracts, Collector configuration, connected traces, error and slow spans, application metrics, dashboard queries, and structured log correlation:
+
+```bash
+.venv/bin/python scripts/verify_stack.py
+```
+
+Demonstrate bounded Collector and Jaeger outages. The command stops and starts only this Compose project's services and restores the stack in a final cleanup step:
+
+```bash
+.venv/bin/python scripts/demonstrate_failures.py
+```
+
+The Collector exporter has an explicit 256-batch in-memory queue with bounded retry. It can bridge a short backend outage while the Collector remains alive, but it is not persistent and cannot guarantee delivery after a Collector crash.
+
+Demonstrate approximate 25% parent-aware head sampling with 200 requests, verify that custom metrics still count every request, and restore full capture:
+
+```bash
+.venv/bin/python scripts/demonstrate_sampling.py
+```
+
+All scripts use bounded polling deadlines. Generated logs, traffic output, verification output, local telemetry data, and local artifacts are ignored by Git.
+
+For local troubleshooting:
+
+```bash
+docker compose config --quiet
+docker compose ps
+docker compose logs --since 5m checkout-api inventory-api otel-collector
+docker compose run --rm --no-deps --entrypoint /otelcol \
+  otel-collector validate --config=/etc/otelcol/config.yaml
+docker compose up --detach --wait --wait-timeout 120
+```
 
 ## Native Python development
 
@@ -109,6 +169,8 @@ Supported scenarios are `normal`, `slow`, `error`, and `out-of-stock`. The `slow
 | `INVENTORY_HTTP_TIMEOUT_SECONDS` | `2.0` | Checkout-to-inventory HTTP timeout. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | Full OTLP/HTTP endpoint used by both services for spans. |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | Full OTLP/HTTP endpoint used by both services for metrics. |
+| `OTEL_TRACES_SAMPLER` | `always_on` in Compose | SDK head sampler; use `parentbased_traceidratio` for parent-aware ratio sampling. |
+| `OTEL_TRACES_SAMPLER_ARG` | empty | Sampler argument, such as `0.25` for 25% ratio sampling. |
 | `GRAFANA_ADMIN_USER` | `admin` | Local Grafana administrator name used by Compose. |
 | `GRAFANA_ADMIN_PASSWORD_FILE` | `./.local-secrets/grafana_admin_password` | Ignored local password file consumed through Grafana's secret-file setting. |
 | `ENABLE_LOCAL_SIMULATIONS` | `false` | Enables slow and error scenarios only when `APP_ENV=local`. |

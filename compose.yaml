@@ -81,6 +81,8 @@ services:
       ENABLE_LOCAL_SIMULATIONS: "true"
       OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318/v1/metrics
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-always_on}
+      OTEL_TRACES_SAMPLER_ARG: "${OTEL_TRACES_SAMPLER_ARG:-}"
       SIMULATED_DELAY_SECONDS: "1.0"
     expose:
       - "8001"
@@ -124,6 +126,8 @@ services:
       INVENTORY_HTTP_TIMEOUT_SECONDS: "2.0"
       OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318/v1/metrics
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-always_on}
+      OTEL_TRACES_SAMPLER_ARG: "${OTEL_TRACES_SAMPLER_ARG:-}"
     ports:
       - target: 8000
         published: "8000"

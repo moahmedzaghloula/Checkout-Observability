@@ -16,6 +16,16 @@ processors:
 exporters:
   otlp_grpc/jaeger:
     endpoint: jaeger:4317
+    timeout: 3s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 5s
+      max_elapsed_time: 30s
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 256
     tls:
       insecure: true
   prometheus/application:

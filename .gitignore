@@ -13,6 +13,11 @@ __pycache__/
 .coverage
 htmlcov/
 coverage.xml
+*.log
+traffic-output.*
+verification-output.*
+.artifacts/
+.local-data/
 .ruff_cache/
 .mypy_cache/
 dist/
