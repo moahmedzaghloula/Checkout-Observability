@@ -1,8 +1,18 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 import httpx
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
+from opentelemetry.trace import StatusCode
 import pytest
 
 from services.inventory_api.main import create_app
 from shared.config import Settings
+from shared.telemetry import TelemetryRuntime, build_resource
 
 
 pytestmark = pytest.mark.asyncio
@@ -14,10 +24,38 @@ NORMAL_REQUEST = {
 }
 
 
-def inventory_client(settings: Settings | None = None) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_app(settings or Settings())),
-        base_url="http://inventory.test",
+@asynccontextmanager
+async def inventory_client(
+    settings: Settings | None = None,
+    telemetry: TelemetryRuntime | None = None,
+) -> AsyncIterator[httpx.AsyncClient]:
+    runtime_settings = settings or Settings()
+    telemetry_runtime = telemetry or make_test_telemetry(runtime_settings)[0]
+    app = create_app(
+        runtime_settings,
+        telemetry_factory=lambda _settings: telemetry_runtime,
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://inventory.test",
+        ) as client:
+            yield client
+
+
+def make_test_telemetry(
+    settings: Settings,
+) -> tuple[TelemetryRuntime, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(resource=build_resource(settings, "inventory-api"))
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return (
+        TelemetryRuntime(
+            service_name="inventory-api",
+            provider=provider,
+            tracer=provider.get_tracer("inventory-api.tests", "0.1.0"),
+        ),
+        exporter,
     )
 
 
@@ -42,6 +80,30 @@ async def test_repeated_checks_do_not_decrement_stock() -> None:
         "requested_quantity": 2,
         "available": True,
         "available_stock": 10,
+    }
+
+
+async def test_inventory_creates_lookup_span() -> None:
+    settings = Settings(app_env="test")
+    telemetry, exporter = make_test_telemetry(settings)
+
+    async with inventory_client(settings, telemetry) as client:
+        response = await client.post("/check", json=NORMAL_REQUEST)
+
+    spans = exporter.get_finished_spans()
+    assert response.status_code == 200
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.name == "inventory.lookup"
+    assert span.resource.attributes["service.name"] == "inventory-api"
+    assert span.resource.attributes["service.version"] == "0.1.0"
+    assert span.resource.attributes["deployment.environment.name"] == "test"
+    assert span.attributes == {
+        "inventory.quantity": 2,
+        "inventory.scenario": "normal",
+        "inventory.available": True,
+        "inventory.outcome": "available",
+        "inventory.response.status_code": 200,
     }
 
 
@@ -112,11 +174,16 @@ async def test_local_error_scenario_returns_service_unavailable() -> None:
     settings = Settings(app_env="local", enable_local_simulations=True)
     request = {**NORMAL_REQUEST, "scenario": "error"}
 
-    async with inventory_client(settings) as client:
+    telemetry, exporter = make_test_telemetry(settings)
+    async with inventory_client(settings, telemetry) as client:
         response = await client.post("/check", json=request)
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "simulated_inventory_failure"
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.attributes["inventory.outcome"] == "simulated_failure"
+    assert span.events == ()
 
 
 async def test_local_slow_scenario_returns_normal_availability() -> None:

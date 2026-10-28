@@ -1,5 +1,5 @@
 **
-!requirements.checkout.runtime.lock
+!requirements.runtime.lock
 !shared/
 !shared/**
 !services/

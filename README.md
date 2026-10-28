@@ -7,7 +7,7 @@ Checkout Observability is a small Python service pair designed as a practical fo
 - `checkout-api` exposes `GET /health` and `POST /checkout` on port `8000`.
 - `inventory-api` exposes `GET /health` and `POST /check` on port `8001`.
 - The checkout service uses one lifespan-managed asynchronous HTTP client to call the inventory service.
-- `checkout-api` exports manual checkout spans over OTLP/HTTP to an OpenTelemetry Collector, which batches and forwards them to Jaeger over OTLP/gRPC.
+- Both services export traces over OTLP/HTTP to an OpenTelemetry Collector, which batches and forwards them to Jaeger over OTLP/gRPC.
 - Both APIs return a consistent success or error envelope and publish interactive OpenAPI documentation at `/docs`.
 
 ## Requirements
@@ -43,9 +43,11 @@ The Compose configuration is intended for local development and explicitly enabl
 
 ## Tracing
 
-Each valid checkout request creates a manual `checkout.process` span. The trace resource identifies `service.name`, `service.version`, and `deployment.environment.name`; span attributes are bounded and exclude request bodies, product IDs, headers, and credentials. Metrics and OpenTelemetry log export are not configured.
+FastAPI and httpx instrumentation are configured programmatically. W3C Trace Context propagation connects the checkout server span, manual `checkout.process` span, outbound HTTP client span, inventory server span, and manual `inventory.lookup` span in one trace. Health endpoints are excluded, and span attributes are bounded and exclude request bodies, product IDs, headers, and credentials. Do not add the OpenTelemetry zero-code agent on top of this explicit setup because it would duplicate instrumentation.
 
-Use the Jaeger UI at `http://127.0.0.1:16686` and select `checkout-api` after submitting a checkout. The local stack pins OpenTelemetry Collector `0.162.0` and Jaeger `2.22.0` by version and image digest. Python tracing packages are pinned at `1.45.1` in the dependency lock files.
+Each service uses a distinct `service.name` with the same `service.version` and `deployment.environment.name` resource attributes. Metrics and OpenTelemetry log export are not configured.
+
+Use the Jaeger UI at `http://127.0.0.1:16686` and select `checkout-api` after submitting a checkout. The local stack pins OpenTelemetry Collector `0.162.0` and Jaeger `2.22.0` by version and image digest. Python tracing packages are pinned at `1.45.1`; FastAPI and httpx instrumentation packages are pinned at `0.66b1`.
 
 ## Native Python development
 
@@ -73,7 +75,7 @@ Supported scenarios are `normal`, `slow`, `error`, and `out-of-stock`. The `slow
 | `APP_ENV` | `development` | Runtime environment; must be `local` for simulations. |
 | `INVENTORY_API_URL` | `http://127.0.0.1:8001` | Inventory service base URL used by checkout. |
 | `INVENTORY_HTTP_TIMEOUT_SECONDS` | `2.0` | Checkout-to-inventory HTTP timeout. |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | Full OTLP/HTTP endpoint used by checkout for spans. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | Full OTLP/HTTP endpoint used by both services for spans. |
 | `ENABLE_LOCAL_SIMULATIONS` | `false` | Enables slow and error scenarios only when `APP_ENV=local`. |
 | `SIMULATED_DELAY_SECONDS` | `1.0` | Delay applied to the local slow scenario. |
 
@@ -91,4 +93,4 @@ Supported scenarios are `normal`, `slow`, `error`, and `out-of-stock`. The `slow
 .venv/bin/python -m pytest
 ```
 
-The tests exercise validation, deterministic inventory behavior, local-only simulations, service-to-service calls, error mapping, timeout handling, HTTP client shutdown, telemetry lifecycle, and span metadata.
+The tests exercise validation, deterministic inventory behavior, local-only simulations, service-to-service calls, error mapping, timeout handling, HTTP client shutdown, telemetry lifecycle, parent-child relationships, exception recording, and span metadata.

@@ -2,6 +2,7 @@
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
+asgiref==3.12.1
 certifi==2026.10.19
 charset-normalizer==3.5.2
 click==8.5.0
@@ -17,9 +18,14 @@ opentelemetry-exporter-http-transport==0.66b1
 opentelemetry-exporter-otlp-common==0.66b1
 opentelemetry-exporter-otlp-proto-common==1.45.1
 opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-instrumentation==0.66b1
+opentelemetry-instrumentation-asgi==0.66b1
+opentelemetry-instrumentation-fastapi==0.66b1
+opentelemetry-instrumentation-httpx==0.66b1
 opentelemetry-proto==1.45.1
 opentelemetry-sdk==1.45.1
 opentelemetry-semantic-conventions==0.66b1
+opentelemetry-util-http==0.66b1
 packaging==26.3
 pluggy==1.7.0
 protobuf==7.36.2
@@ -34,3 +40,4 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 urllib3==2.8.0
 uvicorn==0.53.0
+wrapt==2.5.1

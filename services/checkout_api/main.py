@@ -8,15 +8,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import httpx
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.trace import Span, Status, StatusCode, Tracer
 from pydantic import ValidationError
 
-from services.checkout_api.telemetry import (
-    SERVICE_NAME,
-    SERVICE_VERSION,
-    TelemetryRuntime,
-    initialize_telemetry,
-)
 from shared.config import Settings
 from shared.errors import error_response, install_validation_handler
 from shared.models import (
@@ -27,7 +22,14 @@ from shared.models import (
     HealthResponse,
     InventoryCheckResponse,
 )
+from shared.telemetry import (
+    SERVICE_VERSION,
+    TelemetryRuntime,
+    initialize_telemetry,
+    instrument_fastapi_app,
+)
 
+SERVICE_NAME = "checkout-api"
 HttpClientFactory = Callable[[Settings], httpx.AsyncClient]
 TelemetryFactory = Callable[[Settings], TelemetryRuntime]
 
@@ -39,10 +41,14 @@ def _default_http_client(settings: Settings) -> httpx.AsyncClient:
     )
 
 
+def _default_telemetry(settings: Settings) -> TelemetryRuntime:
+    return initialize_telemetry(settings, SERVICE_NAME)
+
+
 def create_app(
     settings: Settings | None = None,
     http_client_factory: HttpClientFactory = _default_http_client,
-    telemetry_factory: TelemetryFactory = initialize_telemetry,
+    telemetry_factory: TelemetryFactory = _default_telemetry,
 ) -> FastAPI:
     runtime_settings = settings or Settings.from_env()
 
@@ -51,11 +57,20 @@ def create_app(
         telemetry = telemetry_factory(runtime_settings)
         application.state.tracer = telemetry.tracer
         application.state.inventory_client = http_client_factory(runtime_settings)
+        HTTPXClientInstrumentor.instrument_client(
+            application.state.inventory_client,
+            tracer_provider=telemetry.provider,
+        )
         try:
             yield
         finally:
-            await application.state.inventory_client.aclose()
-            telemetry.shutdown()
+            HTTPXClientInstrumentor.uninstrument_client(
+                application.state.inventory_client
+            )
+            try:
+                await application.state.inventory_client.aclose()
+            finally:
+                telemetry.shutdown()
 
     application = FastAPI(
         title="Checkout API",
@@ -97,7 +112,8 @@ def create_app(
                 inventory_http_response = await client.post(
                     "/check", json=request.model_dump(mode="json")
                 )
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as exc:
+                span.record_exception(exc)
                 _record_outcome(span, "inventory_timeout", 504)
                 return error_response(
                     service=SERVICE_NAME,
@@ -105,7 +121,8 @@ def create_app(
                     code="inventory_timeout",
                     message="The inventory service did not respond in time",
                 )
-            except httpx.RequestError:
+            except httpx.RequestError as exc:
+                span.record_exception(exc)
                 _record_outcome(span, "inventory_unreachable", 502)
                 return error_response(
                     service=SERVICE_NAME,
@@ -157,6 +174,7 @@ def create_app(
                 )
             )
 
+    instrument_fastapi_app(application)
     return application
 
 

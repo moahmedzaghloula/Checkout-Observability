@@ -1,7 +1,8 @@
 from opentelemetry.sdk.trace.export import SpanExportResult
+import pytest
 
-from services.checkout_api import telemetry
 from shared.config import Settings
+from shared import telemetry
 
 
 class StubExporter:
@@ -25,14 +26,16 @@ def test_initialize_telemetry_creates_one_provider_per_process(monkeypatch) -> N
         registered_providers.append,
     )
 
-    first = telemetry.initialize_telemetry(Settings(app_env="test"))
-    second = telemetry.initialize_telemetry(Settings(app_env="different"))
+    first = telemetry.initialize_telemetry(Settings(app_env="test"), "checkout-api")
+    second = telemetry.initialize_telemetry(Settings(app_env="different"), "checkout-api")
 
     assert first is second
     assert registered_providers == [first.provider]
     assert first.provider.resource.attributes["service.name"] == "checkout-api"
     assert first.provider.resource.attributes["service.version"] == "0.1.0"
     assert first.provider.resource.attributes["deployment.environment.name"] == "test"
+    with pytest.raises(RuntimeError, match="another service"):
+        telemetry.initialize_telemetry(Settings(app_env="test"), "inventory-api")
     first.shutdown()
 
 

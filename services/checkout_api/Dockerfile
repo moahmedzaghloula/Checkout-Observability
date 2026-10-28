@@ -9,11 +9,11 @@ WORKDIR /app
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
 
-COPY requirements.checkout.runtime.lock ./
+COPY requirements.runtime.lock ./
 RUN python -m pip install \
     --no-cache-dir \
     --root-user-action=ignore \
-    --requirement requirements.checkout.runtime.lock
+    --requirement requirements.runtime.lock
 
 COPY shared/ ./shared/
 COPY services/__init__.py ./services/__init__.py

@@ -7,13 +7,13 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
-from opentelemetry.trace import StatusCode
+from opentelemetry.trace import SpanKind, StatusCode
 import pytest
 
 from services.checkout_api.main import create_app as create_checkout_app
-from services.checkout_api.telemetry import TelemetryRuntime, build_resource
 from services.inventory_api.main import create_app as create_inventory_app
 from shared.config import Settings
+from shared.telemetry import TelemetryRuntime, build_resource
 
 
 pytestmark = pytest.mark.asyncio
@@ -64,10 +64,11 @@ def make_test_telemetry(
     settings: Settings,
 ) -> tuple[TelemetryRuntime, InMemorySpanExporter]:
     exporter = InMemorySpanExporter()
-    provider = TracerProvider(resource=build_resource(settings))
+    provider = TracerProvider(resource=build_resource(settings, "checkout-api"))
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     return (
         TelemetryRuntime(
+            service_name="checkout-api",
             provider=provider,
             tracer=provider.get_tracer("checkout-api.tests", "0.1.0"),
         ),
@@ -108,9 +109,12 @@ async def test_checkout_creates_bounded_process_span() -> None:
 
     spans = exporter.get_finished_spans()
     assert response.status_code == 200
-    assert len(spans) == 1
-    span = spans[0]
+    assert len(spans) == 2
+    span = next(span for span in spans if span.name == "checkout.process")
+    client_span = next(span for span in spans if span.kind is SpanKind.CLIENT)
     assert span.name == "checkout.process"
+    assert client_span.context.trace_id == span.context.trace_id
+    assert client_span.parent.span_id == span.context.span_id
     assert span.resource.attributes["service.name"] == "checkout-api"
     assert span.resource.attributes["service.version"] == "0.1.0"
     assert span.resource.attributes["deployment.environment.name"] == "test"
@@ -136,7 +140,11 @@ async def test_checkout_marks_dependency_failures_as_span_errors() -> None:
     ) as client:
         response = await client.post("/checkout", json=request)
 
-    span = exporter.get_finished_spans()[0]
+    span = next(
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "checkout.process"
+    )
     assert response.status_code == 503
     assert span.status.status_code is StatusCode.ERROR
     assert span.attributes["checkout.outcome"] == "inventory_unavailable"
@@ -171,11 +179,19 @@ async def test_checkout_maps_inventory_timeout() -> None:
     def factory(_settings: Settings) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(timeout_handler))
 
-    async with checkout_client(factory=factory) as client:
+    telemetry, exporter = make_test_telemetry(Settings())
+    async with checkout_client(factory=factory, telemetry=telemetry) as client:
         response = await client.post("/checkout", json=CHECKOUT_REQUEST)
 
     assert response.status_code == 504
     assert response.json()["error"]["code"] == "inventory_timeout"
+    span = next(
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "checkout.process"
+    )
+    assert span.status.status_code is StatusCode.ERROR
+    assert [event.name for event in span.events] == ["exception"]
 
 
 async def test_checkout_closes_inventory_client_on_shutdown() -> None:

@@ -60,17 +60,80 @@ jobs:
             --header 'content-type: application/json' \
             --data '{"product_id":"SKU-001","quantity":2,"scenario":"normal"}'
 
-      - name: Verify trace reached Jaeger
+      - name: Verify distributed trace reached Jaeger
         run: |
-          for attempt in $(seq 1 15); do
-            services="$(curl --fail --silent --show-error http://127.0.0.1:16686/api/v3/services)"
-            if printf '%s' "$services" | grep --quiet 'checkout-api'; then
-              exit 0
-            fi
-            sleep 1
-          done
-          printf '%s\n' 'checkout-api did not appear in Jaeger within 15 seconds'
-          exit 1
+          python - <<'PY'
+          import datetime
+          import json
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          now = datetime.datetime.now(datetime.UTC)
+          query = urllib.parse.urlencode({
+              "query.service_name": "checkout-api",
+              "query.operation_name": "checkout.process",
+              "query.start_time_min": (now - datetime.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "query.start_time_max": (now + datetime.timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "query.search_depth": "20",
+          })
+          url = f"http://127.0.0.1:16686/api/v3/traces?{query}"
+
+          spans = []
+          for _ in range(15):
+              try:
+                  with urllib.request.urlopen(url, timeout=5) as response:
+                      data = json.load(response)
+              except urllib.error.HTTPError as exc:
+                  if exc.code != 404:
+                      raise
+                  data = {}
+
+              spans = []
+              for resource_spans in data.get("result", {}).get("resourceSpans", []):
+                  service_name = next(
+                      attribute["value"]["stringValue"]
+                      for attribute in resource_spans["resource"]["attributes"]
+                      if attribute["key"] == "service.name"
+                  )
+                  for scope_spans in resource_spans.get("scopeSpans", []):
+                      for span in scope_spans.get("spans", []):
+                          spans.append((service_name, span))
+
+              if len(spans) == 5:
+                  break
+              time.sleep(1)
+
+          by_key = {(service, span["name"]): span for service, span in spans}
+          required = {
+              ("checkout-api", "POST /checkout"),
+              ("checkout-api", "checkout.process"),
+              ("checkout-api", "POST"),
+              ("inventory-api", "POST /check"),
+              ("inventory-api", "inventory.lookup"),
+          }
+          if set(by_key) != required:
+              raise SystemExit(f"unexpected distributed trace spans: {sorted(by_key)}")
+
+          checkout_server = by_key[("checkout-api", "POST /checkout")]
+          checkout_process = by_key[("checkout-api", "checkout.process")]
+          http_client = by_key[("checkout-api", "POST")]
+          inventory_server = by_key[("inventory-api", "POST /check")]
+          inventory_lookup = by_key[("inventory-api", "inventory.lookup")]
+          if len({span["traceId"] for _, span in spans}) != 1:
+              raise SystemExit("spans do not share one trace ID")
+          expected_parents = {
+              checkout_process["spanId"]: checkout_server["spanId"],
+              http_client["spanId"]: checkout_process["spanId"],
+              inventory_server["spanId"]: http_client["spanId"],
+              inventory_lookup["spanId"]: inventory_server["spanId"],
+          }
+          for span_id, expected_parent in expected_parents.items():
+              span = next(span for _, span in spans if span["spanId"] == span_id)
+              if span.get("parentSpanId") != expected_parent:
+                  raise SystemExit(f"incorrect parent for span {span_id}")
+          PY
 
       - name: Stop services
         if: always()
