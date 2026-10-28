@@ -2,6 +2,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -49,11 +51,17 @@ def make_test_telemetry(
     exporter = InMemorySpanExporter()
     provider = TracerProvider(resource=build_resource(settings, "inventory-api"))
     provider.add_span_processor(SimpleSpanProcessor(exporter))
+    meter_provider = MeterProvider(
+        resource=build_resource(settings, "inventory-api"),
+        metric_readers=[InMemoryMetricReader()],
+    )
     return (
         TelemetryRuntime(
             service_name="inventory-api",
             provider=provider,
             tracer=provider.get_tracer("inventory-api.tests", "0.1.0"),
+            meter_provider=meter_provider,
+            meter=meter_provider.get_meter("inventory-api.tests", "0.1.0"),
         ),
         exporter,
     )

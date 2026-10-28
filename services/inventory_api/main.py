@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+import logging
+from time import perf_counter
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -13,6 +15,7 @@ from opentelemetry.trace import Span, Status, StatusCode, Tracer
 
 from shared.config import Settings
 from shared.errors import error_response, install_validation_handler
+from shared.logging import configure_application_logging
 from shared.models import (
     ErrorResponse,
     HealthResponse,
@@ -47,11 +50,15 @@ def create_app(
     telemetry_factory: TelemetryFactory = _default_telemetry,
 ) -> FastAPI:
     runtime_settings = settings or Settings.from_env()
+    application_logger = configure_application_logging(
+        SERVICE_NAME, runtime_settings.app_env
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         telemetry = telemetry_factory(runtime_settings)
         application.state.tracer = telemetry.tracer
+        application.state.logger = application_logger
         try:
             yield
         finally:
@@ -62,6 +69,7 @@ def create_app(
         version=SERVICE_VERSION,
         lifespan=lifespan,
     )
+    application.state.logger = application_logger
     application.state.tracer = trace.get_tracer(
         f"{SERVICE_NAME}.application", SERVICE_VERSION
     )
@@ -85,6 +93,8 @@ def create_app(
         http_request: Request,
     ) -> InventoryCheckResponse | JSONResponse:
         tracer: Tracer = http_request.app.state.tracer
+        logger: logging.Logger = http_request.app.state.logger
+        started_at = perf_counter()
         with tracer.start_as_current_span(
             "inventory.lookup",
             attributes={
@@ -95,7 +105,9 @@ def create_app(
             try:
                 stock = CATALOG.get(request.product_id)
                 if stock is None:
-                    _record_lookup_outcome(span, "product_not_found", 404)
+                    _record_lookup_outcome(
+                        span, logger, started_at, "product_not_found", 404
+                    )
                     return error_response(
                         service=SERVICE_NAME,
                         status_code=404,
@@ -105,7 +117,9 @@ def create_app(
 
                 if request.scenario in {Scenario.SLOW, Scenario.ERROR}:
                     if not runtime_settings.enable_local_simulations:
-                        _record_lookup_outcome(span, "simulation_disabled", 400)
+                        _record_lookup_outcome(
+                            span, logger, started_at, "simulation_disabled", 400
+                        )
                         return error_response(
                             service=SERVICE_NAME,
                             status_code=400,
@@ -116,7 +130,9 @@ def create_app(
                 if request.scenario is Scenario.SLOW:
                     await asyncio.sleep(runtime_settings.simulated_delay_seconds)
                 elif request.scenario is Scenario.ERROR:
-                    _record_lookup_outcome(span, "simulated_failure", 503)
+                    _record_lookup_outcome(
+                        span, logger, started_at, "simulated_failure", 503
+                    )
                     return error_response(
                         service=SERVICE_NAME,
                         status_code=503,
@@ -131,6 +147,8 @@ def create_app(
                 span.set_attribute("inventory.available", available)
                 _record_lookup_outcome(
                     span,
+                    logger,
+                    started_at,
                     "available" if available else "out_of_stock",
                     200,
                 )
@@ -143,18 +161,37 @@ def create_app(
                     )
                 )
             except Exception:
-                _record_lookup_outcome(span, "internal_error", 500)
+                _record_lookup_outcome(
+                    span, logger, started_at, "internal_error", 500
+                )
                 raise
 
     instrument_fastapi_app(application)
     return application
 
 
-def _record_lookup_outcome(span: Span, outcome: str, status_code: int) -> None:
+def _record_lookup_outcome(
+    span: Span,
+    logger: logging.Logger,
+    started_at: float,
+    outcome: str,
+    status_code: int,
+) -> None:
+    duration_seconds = max(perf_counter() - started_at, 0.0)
     span.set_attribute("inventory.outcome", outcome)
     span.set_attribute("inventory.response.status_code", status_code)
     if status_code >= 400:
         span.set_status(Status(StatusCode.ERROR))
+    logger.info(
+        "Inventory request completed",
+        extra={
+            "event": "inventory.completed",
+            "outcome": outcome,
+            "result": "success" if status_code < 400 else "error",
+            "status_code": status_code,
+            "duration_seconds": round(duration_seconds, 6),
+        },
+    )
 
 
 app = create_app()

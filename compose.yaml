@@ -46,6 +46,7 @@ services:
     expose:
       - "4318"
       - "13133"
+      - "8889"
     healthcheck:
       test:
         - CMD
@@ -78,6 +79,7 @@ services:
     environment:
       APP_ENV: local
       ENABLE_LOCAL_SIMULATIONS: "true"
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318/v1/metrics
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
       SIMULATED_DELAY_SECONDS: "1.0"
     expose:
@@ -120,6 +122,7 @@ services:
       ENABLE_LOCAL_SIMULATIONS: "true"
       INVENTORY_API_URL: http://inventory-api:8001
       INVENTORY_HTTP_TIMEOUT_SECONDS: "2.0"
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-collector:4318/v1/metrics
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
     ports:
       - target: 8000
@@ -151,8 +154,132 @@ services:
       - service-network
       - edge-network
 
+  prometheus:
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    depends_on:
+      otel-collector:
+        condition: service_healthy
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,Z
+      - prometheus-data:/prometheus
+    ports:
+      - target: 9090
+        published: "9090"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    healthcheck:
+      test:
+        - CMD
+        - /bin/wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:9090/-/ready
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
+    networks:
+      - service-network
+      - edge-network
+
+  grafana-secret-init:
+    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        cp /run/secrets/grafana_admin_password /prepared/grafana_admin_password
+        chmod 0400 /prepared/grafana_admin_password
+        chown 472:0 /prepared/grafana_admin_password
+    secrets:
+      - grafana_admin_password
+    volumes:
+      - grafana-secrets:/prepared
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  grafana:
+    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    depends_on:
+      grafana-secret-init:
+        condition: service_completed_successfully
+      jaeger:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_LOG_MODE: console
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/prepared-secrets/grafana_admin_password
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro,Z
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro,Z
+      - grafana-data:/var/lib/grafana
+      - grafana-secrets:/run/prepared-secrets:ro
+    ports:
+      - target: 3000
+        published: "3000"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:3000/api/health
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
+    networks:
+      - service-network
+      - edge-network
+
 networks:
   service-network:
     internal: true
   edge-network:
     driver: bridge
+
+volumes:
+  grafana-data:
+  grafana-secrets:
+  prometheus-data:
+
+secrets:
+  grafana_admin_password:
+    file: ${GRAFANA_ADMIN_PASSWORD_FILE:-./.local-secrets/grafana_admin_password}

@@ -58,6 +58,7 @@ class Settings:
     inventory_api_url: str = "http://127.0.0.1:8001"
     inventory_http_timeout_seconds: float = 2.0
     otel_traces_endpoint: str = "http://127.0.0.1:4318/v1/traces"
+    otel_metrics_endpoint: str = "http://127.0.0.1:4318/v1/metrics"
     enable_local_simulations: bool = False
     simulated_delay_seconds: float = 1.0
 
@@ -79,6 +80,15 @@ class Settings:
             _validate_http_url(
                 "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
                 self.otel_traces_endpoint.strip(),
+                strip_trailing_slash=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "otel_metrics_endpoint",
+            _validate_http_url(
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                self.otel_metrics_endpoint.strip(),
                 strip_trailing_slash=False,
             ),
         )
@@ -107,6 +117,10 @@ class Settings:
             otel_traces_endpoint=os.getenv(
                 "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
                 "http://127.0.0.1:4318/v1/traces",
+            ),
+            otel_metrics_endpoint=os.getenv(
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                "http://127.0.0.1:4318/v1/metrics",
             ),
             enable_local_simulations=_read_bool(
                 "ENABLE_LOCAL_SIMULATIONS", False

@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+import logging
+from time import perf_counter
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import httpx
+from opentelemetry.metrics import Counter, Histogram, Meter
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.trace import Span, Status, StatusCode, Tracer
 from pydantic import ValidationError
 
 from shared.config import Settings
 from shared.errors import error_response, install_validation_handler
+from shared.logging import configure_application_logging
 from shared.models import (
     CheckoutRequest,
     CheckoutResponse,
@@ -34,6 +39,49 @@ HttpClientFactory = Callable[[Settings], httpx.AsyncClient]
 TelemetryFactory = Callable[[Settings], TelemetryRuntime]
 
 
+@dataclass(frozen=True, slots=True)
+class CheckoutMetrics:
+    """Bounded metric instruments for validated checkout attempts."""
+
+    request_counter: Counter
+    duration_histogram: Histogram
+
+    @classmethod
+    def create(cls, meter: Meter) -> CheckoutMetrics:
+        return cls(
+            request_counter=meter.create_counter(
+                "checkout.requests",
+                unit="{request}",
+                description="Validated checkout requests handled",
+            ),
+            duration_histogram=meter.create_histogram(
+                "checkout.request.duration",
+                unit="s",
+                description="Validated checkout request duration",
+                explicit_bucket_boundaries_advisory=(
+                    0.005,
+                    0.01,
+                    0.025,
+                    0.05,
+                    0.1,
+                    0.25,
+                    0.5,
+                    1.0,
+                    2.5,
+                    5.0,
+                ),
+            ),
+        )
+
+    def record(self, outcome: str, duration_seconds: float) -> None:
+        attributes = {
+            "outcome": outcome,
+            "result": "success" if outcome == "accepted" else "error",
+        }
+        self.request_counter.add(1, attributes)
+        self.duration_histogram.record(duration_seconds, attributes)
+
+
 def _default_http_client(settings: Settings) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=settings.inventory_api_url,
@@ -51,11 +99,16 @@ def create_app(
     telemetry_factory: TelemetryFactory = _default_telemetry,
 ) -> FastAPI:
     runtime_settings = settings or Settings.from_env()
+    application_logger = configure_application_logging(
+        SERVICE_NAME, runtime_settings.app_env
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         telemetry = telemetry_factory(runtime_settings)
         application.state.tracer = telemetry.tracer
+        application.state.checkout_metrics = CheckoutMetrics.create(telemetry.meter)
+        application.state.logger = application_logger
         application.state.inventory_client = http_client_factory(runtime_settings)
         HTTPXClientInstrumentor.instrument_client(
             application.state.inventory_client,
@@ -77,6 +130,7 @@ def create_app(
         version=SERVICE_VERSION,
         lifespan=lifespan,
     )
+    application.state.logger = application_logger
     install_validation_handler(application, SERVICE_NAME)
 
     @application.get("/health", response_model=HealthResponse)
@@ -100,6 +154,9 @@ def create_app(
     ) -> CheckoutResponse | JSONResponse:
         client: httpx.AsyncClient = http_request.app.state.inventory_client
         tracer: Tracer = http_request.app.state.tracer
+        checkout_metrics: CheckoutMetrics = http_request.app.state.checkout_metrics
+        logger: logging.Logger = http_request.app.state.logger
+        started_at = perf_counter()
 
         with tracer.start_as_current_span(
             "checkout.process",
@@ -114,7 +171,14 @@ def create_app(
                 )
             except httpx.TimeoutException as exc:
                 span.record_exception(exc)
-                _record_outcome(span, "inventory_timeout", 504)
+                _record_outcome(
+                    span,
+                    checkout_metrics,
+                    logger,
+                    started_at,
+                    "inventory_timeout",
+                    504,
+                )
                 return error_response(
                     service=SERVICE_NAME,
                     status_code=504,
@@ -123,7 +187,14 @@ def create_app(
                 )
             except httpx.RequestError as exc:
                 span.record_exception(exc)
-                _record_outcome(span, "inventory_unreachable", 502)
+                _record_outcome(
+                    span,
+                    checkout_metrics,
+                    logger,
+                    started_at,
+                    "inventory_unreachable",
+                    502,
+                )
                 return error_response(
                     service=SERVICE_NAME,
                     status_code=502,
@@ -138,6 +209,9 @@ def create_app(
                 mapped_response = _map_inventory_error(inventory_http_response)
                 _record_outcome(
                     span,
+                    checkout_metrics,
+                    logger,
+                    started_at,
                     _inventory_error_outcome(inventory_http_response.status_code),
                     mapped_response.status_code,
                 )
@@ -148,7 +222,14 @@ def create_app(
                     inventory_http_response.json()
                 )
             except (ValueError, ValidationError):
-                _record_outcome(span, "invalid_inventory_response", 502)
+                _record_outcome(
+                    span,
+                    checkout_metrics,
+                    logger,
+                    started_at,
+                    "invalid_inventory_response",
+                    502,
+                )
                 return error_response(
                     service=SERVICE_NAME,
                     status_code=502,
@@ -158,7 +239,14 @@ def create_app(
 
             span.set_attribute("checkout.inventory.available", inventory.data.available)
             if not inventory.data.available:
-                _record_outcome(span, "out_of_stock", 409)
+                _record_outcome(
+                    span,
+                    checkout_metrics,
+                    logger,
+                    started_at,
+                    "out_of_stock",
+                    409,
+                )
                 return error_response(
                     service=SERVICE_NAME,
                     status_code=409,
@@ -166,7 +254,14 @@ def create_app(
                     message="The requested quantity is not available",
                 )
 
-            _record_outcome(span, "accepted", 200)
+            _record_outcome(
+                span,
+                checkout_metrics,
+                logger,
+                started_at,
+                "accepted",
+                200,
+            )
             return CheckoutResponse(
                 data=CheckoutResult(
                     product_id=request.product_id,
@@ -204,11 +299,31 @@ def _inventory_error_outcome(status_code: int) -> str:
     }.get(status_code, "inventory_bad_gateway")
 
 
-def _record_outcome(span: Span, outcome: str, status_code: int) -> None:
+def _record_outcome(
+    span: Span,
+    checkout_metrics: CheckoutMetrics,
+    logger: logging.Logger,
+    started_at: float,
+    outcome: str,
+    status_code: int,
+) -> None:
+    duration_seconds = max(perf_counter() - started_at, 0.0)
+    result = "success" if outcome == "accepted" else "error"
     span.set_attribute("checkout.outcome", outcome)
     span.set_attribute("checkout.response.status_code", status_code)
     if status_code >= 500:
         span.set_status(Status(StatusCode.ERROR))
+    checkout_metrics.record(outcome, duration_seconds)
+    logger.info(
+        "Checkout request completed",
+        extra={
+            "event": "checkout.completed",
+            "outcome": outcome,
+            "result": result,
+            "status_code": status_code,
+            "duration_seconds": round(duration_seconds, 6),
+        },
+    )
 
 
 app = create_app()

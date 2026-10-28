@@ -2,6 +2,8 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 import httpx
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -66,11 +68,17 @@ def make_test_telemetry(
     exporter = InMemorySpanExporter()
     provider = TracerProvider(resource=build_resource(settings, "checkout-api"))
     provider.add_span_processor(SimpleSpanProcessor(exporter))
+    meter_provider = MeterProvider(
+        resource=build_resource(settings, "checkout-api"),
+        metric_readers=[InMemoryMetricReader()],
+    )
     return (
         TelemetryRuntime(
             service_name="checkout-api",
             provider=provider,
             tracer=provider.get_tracer("checkout-api.tests", "0.1.0"),
+            meter_provider=meter_provider,
+            meter=meter_provider.get_meter("checkout-api.tests", "0.1.0"),
         ),
         exporter,
     )
@@ -158,6 +166,56 @@ async def test_checkout_returns_conflict_when_product_is_unavailable() -> None:
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "out_of_stock"
+
+
+async def test_checkout_records_bounded_counter_and_duration_metrics() -> None:
+    settings = Settings(app_env="test")
+    span_exporter = InMemorySpanExporter()
+    trace_provider = TracerProvider(
+        resource=build_resource(settings, "checkout-api")
+    )
+    trace_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+    metric_reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(
+        resource=build_resource(settings, "checkout-api"),
+        metric_readers=[metric_reader],
+    )
+    telemetry = TelemetryRuntime(
+        service_name="checkout-api",
+        provider=trace_provider,
+        tracer=trace_provider.get_tracer("checkout-api.tests", "0.1.0"),
+        meter_provider=meter_provider,
+        meter=meter_provider.get_meter("checkout-api.tests", "0.1.0"),
+    )
+
+    async with checkout_client(settings=settings, telemetry=telemetry) as client:
+        accepted = await client.post("/checkout", json=CHECKOUT_REQUEST)
+        unavailable = await client.post(
+            "/checkout", json={**CHECKOUT_REQUEST, "scenario": "out-of-stock"}
+        )
+        metric_data = metric_reader.get_metrics_data()
+
+    assert accepted.status_code == 200
+    assert unavailable.status_code == 409
+    metrics = {
+        metric.name: metric
+        for resource_metric in metric_data.resource_metrics
+        for scope_metric in resource_metric.scope_metrics
+        for metric in scope_metric.metrics
+    }
+    counter = metrics["checkout.requests"]
+    histogram = metrics["checkout.request.duration"]
+    assert counter.unit == "{request}"
+    assert histogram.unit == "s"
+    assert {
+        (point.attributes["outcome"], point.attributes["result"], point.value)
+        for point in counter.data.data_points
+    } == {
+        ("accepted", "success", 1),
+        ("out_of_stock", "error", 1),
+    }
+    assert all(point.count == 1 for point in histogram.data.data_points)
+    assert all(point.sum >= 0 for point in histogram.data.data_points)
 
 
 async def test_checkout_maps_inventory_failure() -> None:
