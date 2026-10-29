@@ -1,43 +1,101 @@
 # Checkout Observability
 
-Checkout Observability is a small Python service pair designed as a practical foundation for reliability and observability work. The public `checkout-api` validates a checkout request and asks `inventory-api` whether a product is available. Inventory is held in a fixed in-memory catalog, and checks never decrement stock, so repeated requests are deterministic.
+Checkout Observability is a small, deterministic two-service system for exercising local observability workflows. `checkout-api` validates checkout requests and calls `inventory-api`, which reads a fixed in-memory catalog without decrementing stock. The repository includes distributed tracing, custom metrics, correlated JSON logs, provisioned dashboards, reproducible traffic, and bounded failure demonstrations.
 
 ## Architecture
 
-- `checkout-api` exposes `GET /health` and `POST /checkout` on port `8000`.
-- `inventory-api` exposes `GET /health` and `POST /check` on port `8001`.
-- The checkout service uses one lifespan-managed asynchronous HTTP client to call the inventory service.
-- Both services export traces and metrics over OTLP/HTTP to an OpenTelemetry Collector. The Collector forwards traces to Jaeger and exposes received application metrics for Prometheus to scrape.
-- Prometheus stores time-series data, while Grafana is provisioned with Prometheus and Jaeger data sources plus a checkout dashboard.
-- Application events are written as structured JSON to standard output with active trace and span correlation.
-- Both APIs return a consistent success or error envelope and publish interactive OpenAPI documentation at `/docs`.
+```mermaid
+flowchart LR
+    User[Local client] -->|HTTP :8000| Checkout[checkout-api]
+    Checkout -->|HTTP + W3C traceparent| Inventory[inventory-api]
 
-## Requirements
+    Checkout -.->|OTLP/HTTP traces + metrics| Collector[OpenTelemetry Collector]
+    Inventory -.->|OTLP/HTTP traces| Collector
+    Collector -->|OTLP/gRPC traces| Jaeger[Jaeger]
+    Collector -->|Prometheus application metrics :8889| Prometheus[Prometheus]
+    Prometheus -->|PromQL| Grafana[Grafana]
+    Jaeger -->|Trace queries| Grafana
 
-- Python 3.11 through 3.14; Python 3.13 is used by CI and the lock file.
-- Docker Engine with Docker Compose v2 for the containerized local environment.
+    Checkout -->|JSON stdout| Logs[Container stdout logs]
+    Inventory -->|JSON stdout| Logs
+```
 
-## Containerized local development
+Logs are correlated with traces but are not exported to Grafana or stored in a log backend.
 
-Generate a local Grafana password without printing it, then build the images and wait for all services to become healthy:
+## Components
+
+| Component | Role |
+| --- | --- |
+| `checkout-api` | Public FastAPI service exposing `GET /health` and `POST /checkout`. |
+| `inventory-api` | Internal FastAPI service exposing `GET /health` and `POST /check`. |
+| OpenTelemetry Collector | Receives OTLP/HTTP, limits memory, batches signals, exports traces, and exposes application metrics. |
+| Jaeger | Stores and displays local traces using transient in-memory storage. |
+| Prometheus | Scrapes Collector-exported application metrics and stores local time series. |
+| Grafana | Uses provisioned Prometheus and Jaeger data sources and a three-panel dashboard. |
+
+## Prerequisites and pinned versions
+
+- A maintained Fedora release with Docker Engine and Docker Compose v2.
+- Python 3.11–3.14 for native development; Python 3.13 is used by CI and the lock files.
+- OpenSSL for local credential generation.
+- `curl` for API examples.
+
+| Dependency or image | Version |
+| --- | --- |
+| Python container | `3.13.16-slim-bookworm` |
+| FastAPI / httpx / Uvicorn | `0.140.10` / `0.28.1` / `0.53.0` |
+| OpenTelemetry API, SDK, OTLP exporter | `1.45.1` |
+| OpenTelemetry FastAPI and httpx instrumentation | `0.66b1` |
+| OpenTelemetry Collector | `0.162.0` |
+| Jaeger | `2.22.0` |
+| Prometheus | `3.15.1` |
+| Grafana | `13.3.0` |
+
+Python dependencies are fully resolved in `requirements.lock` and `requirements.runtime.lock`. Container images are pinned by version and multi-platform digest in `compose.yaml` and the service Dockerfiles.
+
+## Fresh-clone setup
+
+Replace `OWNER` with the GitHub account or organization that owns the repository:
 
 ```bash
+git clone https://github.com/OWNER/checkout-observability.git
+cd checkout-observability
+
+docker version
+docker compose version
+
+python3.13 -m venv .venv
+.venv/bin/python -m pip install --requirement requirements.lock
+
 install -d -m 700 .local-secrets
 umask 077
 openssl rand -hex 32 | tr -d '\n' > .local-secrets/grafana_admin_password
-docker compose up --build --wait
+
+docker compose up --build --detach --wait --wait-timeout 180
 ```
 
-Browser and API ports bind only to localhost:
+On Fedora, the Compose bind mounts already use private `:Z` SELinux labels. Do not disable SELinux or the firewall. If Docker is installed but inactive, start it with:
 
-- Checkout API: `http://127.0.0.1:8000`
-- Grafana: `http://127.0.0.1:3000`
-- Prometheus: `http://127.0.0.1:9090`
-- Jaeger: `http://127.0.0.1:16686`
+```bash
+sudo systemctl enable --now docker
+```
 
-Sign in to Grafana as `admin` with the password stored in the ignored `.local-secrets/grafana_admin_password` file. Inventory, the Collector's OTLP receiver, and its Prometheus exporter remain internal to the Compose network. Grafana, Prometheus, and the applications reach one another through Compose service names rather than `localhost`.
+The application does not load `.env` files itself. `.env.example` contains non-sensitive defaults and placeholders; prefer explicit environment variables for local overrides. Grafana reads its generated password through the documented secret-file setting and the password is never placed in Compose, provisioning, or an image layer.
 
-Submit a checkout:
+## Local endpoints
+
+| Endpoint | Published address |
+| --- | --- |
+| Checkout API and OpenAPI UI | `http://127.0.0.1:8000` and `http://127.0.0.1:8000/docs` |
+| Grafana | `http://127.0.0.1:3000` |
+| Prometheus | `http://127.0.0.1:9090` |
+| Jaeger | `http://127.0.0.1:16686` |
+
+Sign in to Grafana as `admin` with the password stored in `.local-secrets/grafana_admin_password`. Inventory, OTLP, Collector health, and Collector application-metrics ports are internal to the Compose network.
+
+## API examples
+
+Normal checkout:
 
 ```bash
 curl --request POST http://127.0.0.1:8000/checkout \
@@ -45,29 +103,47 @@ curl --request POST http://127.0.0.1:8000/checkout \
   --data '{"product_id":"SKU-001","quantity":2,"scenario":"normal"}'
 ```
 
-Stop and remove only this Compose application's containers and networks:
+Deterministic out-of-stock response:
 
 ```bash
-docker compose down
+curl --include --request POST http://127.0.0.1:8000/checkout \
+  --header 'content-type: application/json' \
+  --data '{"product_id":"SKU-001","quantity":2,"scenario":"out-of-stock"}'
 ```
 
-The Compose configuration is intended for local development and explicitly enables the `slow` and `error` simulations with `APP_ENV=local`. Configuration mounts use the private `Z` SELinux label required by the Fedora target. Local telemetry hops use plaintext inside the isolated Compose network. Prometheus and Grafana use named volumes; Jaeger still uses transient in-memory storage, so traces are lost when its container stops. This setup is not a production security or durability design.
+Local-only slow and failure simulations:
 
-## Tracing
+```bash
+curl --include --request POST http://127.0.0.1:8000/checkout \
+  --header 'content-type: application/json' \
+  --data '{"product_id":"SKU-001","quantity":2,"scenario":"slow"}'
 
-FastAPI and httpx instrumentation are configured programmatically. W3C Trace Context propagation connects the checkout server span, manual `checkout.process` span, outbound HTTP client span, inventory server span, and manual `inventory.lookup` span in one trace. Health endpoints are excluded, and span attributes are bounded and exclude request bodies, product IDs, headers, and credentials. Do not add the OpenTelemetry zero-code agent on top of this explicit setup because it would duplicate instrumentation.
+curl --include --request POST http://127.0.0.1:8000/checkout \
+  --header 'content-type: application/json' \
+  --data '{"product_id":"SKU-001","quantity":2,"scenario":"error"}'
+```
 
-Each service uses a distinct `service.name` with the same `service.version` and `deployment.environment.name` resource attributes.
+Compose enables these simulations only with `APP_ENV=local` and `ENABLE_LOCAL_SIMULATIONS=true`. They must not be enabled in shared environments.
 
-Use the Jaeger UI at `http://127.0.0.1:16686` and select `checkout-api` after submitting a checkout. The local stack pins OpenTelemetry Collector `0.162.0` and Jaeger `2.22.0` by version and image digest. Python tracing packages are pinned at `1.45.1`; FastAPI and httpx instrumentation packages are pinned at `0.66b1`.
+## Inspecting observability signals
 
-Full trace capture is the local default:
+### Traces
+
+Open Jaeger, select `checkout-api`, and search for `checkout.process`. A normal distributed trace contains:
+
+1. checkout HTTP server span;
+2. `checkout.process` manual span;
+3. outbound httpx client span;
+4. inventory HTTP server span;
+5. `inventory.lookup` manual span.
+
+W3C Trace Context propagates the parent decision between services. The local default is full capture:
 
 ```bash
 OTEL_TRACES_SAMPLER=always_on
 ```
 
-Parent-aware ratio-based head sampling can be selected before recreating both application services:
+Parent-aware 25% head sampling is available through:
 
 ```bash
 OTEL_TRACES_SAMPLER=parentbased_traceidratio \
@@ -75,119 +151,147 @@ OTEL_TRACES_SAMPLER_ARG=0.25 \
 docker compose up --detach --force-recreate --wait inventory-api checkout-api
 ```
 
-The root checkout decision is propagated to inventory through W3C Trace Context. Trace sampling does not change the custom checkout counter or histogram.
+Custom request metrics continue counting independently of trace sampling.
 
-## Metrics and dashboard
+### Metrics and dashboards
 
-The checkout service records `checkout.requests` as a counter and `checkout.request.duration` as an explicit-bucket histogram measured in seconds. A request is included exactly once only after FastAPI validation succeeds and the `/checkout` handler starts; validation responses produced before the handler, including `422`, are excluded. Every included outcome is counted and timed. Only `accepted` has `result="success"`; out of stock, inventory rejection, missing products, invalid upstream responses, timeouts, connection failures, and upstream errors have `result="error"`.
+The checkout service exports:
 
-Metric attributes are limited to the bounded `outcome` and `result` values. Product, customer, order, trace, and span identifiers, request bodies, and raw URLs are never metric labels. The Collector's `prometheus/application` exporter exposes these received application metrics on its internal port `8889`; this is separate from the Collector's own internal operational metrics.
+- `checkout_requests_total`: validated checkout attempts, labeled by bounded `outcome` and `result` values;
+- `checkout_request_duration_seconds`: an explicit-bucket histogram covering the same validated requests.
 
-The provisioned `Checkout Observability` dashboard includes:
+FastAPI validation failures produced before the handler, including `422` responses, are excluded.
 
-- request rate from `sum(rate(checkout_requests_total[$__rate_interval]))`, in requests per second;
-- error ratio from the rate of `result="error"` divided by the total request rate;
-- P95 latency from the actual `checkout_request_duration_seconds_bucket` histogram.
+Useful PromQL queries:
 
-The Prometheus exporter in Collector `0.162.0` is a beta metrics component. Dashboard and data source provisioning is automatic; no manual Grafana UI changes are required. Grafana `13.3.0` and Prometheus `3.15.1` are pinned by version and image digest.
+```promql
+sum(rate(checkout_requests_total[1m]))
 
-## Structured logs
+sum(rate(checkout_requests_total{result="error"}[1m]))
+/
+sum(rate(checkout_requests_total[1m]))
 
-Both applications use Python logging to emit one-line JSON events to standard output. Each event includes an RFC 3339 timestamp, severity, service identity, bounded outcome fields, duration in seconds, and the active OpenTelemetry trace and span IDs. Records emitted outside an active span contain null correlation IDs, preventing context from leaking between requests. Request bodies, authorization headers, credentials, and environment dumps are not logged.
+histogram_quantile(
+  0.95,
+  sum by (le) (rate(checkout_request_duration_seconds_bucket[1m]))
+)
+```
 
-Use `docker compose logs checkout-api` or `docker compose logs inventory-api` for local inspection. A log's `trace_id` can be pasted into Jaeger to locate the connected trace. These correlated stdout records are not an OTLP logs pipeline and are not durable log storage; no Loki or other log backend is included.
+Grafana provisions the `Checkout Observability` dashboard with request-rate, error-ratio, and P95-latency panels. Histogram percentiles are bucket estimates, not exact request durations.
 
-## Reproducible verification
+### Correlated stdout logs
 
-Generate a finite local traffic mix. The target is mandatory and restricted to loopback addresses:
+```bash
+docker compose logs --since 5m checkout-api inventory-api
+```
+
+Application events are one-line JSON records containing timestamp, severity, service identity, outcome, duration, and active trace/span IDs. Use a log's `trace_id` in Jaeger to locate the corresponding trace. These logs remain container stdout only; no OTLP logs pipeline, Loki service, or durable retention is configured.
+
+## Traffic and verification
+
+Generate a finite local traffic mix:
 
 ```bash
 .venv/bin/python scripts/traffic.py \
   --target-url http://127.0.0.1:8000
 ```
 
-The default run sends 20 requests with bounded concurrency and includes normal, slow, simulated failure, and out-of-stock scenarios. It reports response counts and latency summaries; it is not a benchmark or a production load test.
+The default run sends 20 requests with concurrency 4 and includes all four scenarios. It reports response counts and latency summaries; it is not a benchmark or production load test.
 
-Verify health, response contracts, Collector configuration, connected traces, error and slow spans, application metrics, dashboard queries, and structured log correlation:
+Run the complete application and observability verification:
 
 ```bash
 .venv/bin/python scripts/verify_stack.py
 ```
 
-Demonstrate bounded Collector and Jaeger outages. The command stops and starts only this Compose project's services and restores the stack in a final cleanup step:
+Demonstrate bounded Collector and Jaeger outages, then restore the stack:
 
 ```bash
 .venv/bin/python scripts/demonstrate_failures.py
 ```
 
-The Collector exporter has an explicit 256-batch in-memory queue with bounded retry. It can bridge a short backend outage while the Collector remains alive, but it is not persistent and cannot guarantee delivery after a Collector crash.
-
-Demonstrate approximate 25% parent-aware head sampling with 200 requests, verify that custom metrics still count every request, and restore full capture:
+Demonstrate approximate parent-aware sampling with 200 requests and restore `always_on`:
 
 ```bash
 .venv/bin/python scripts/demonstrate_sampling.py
 ```
 
-All scripts use bounded polling deadlines. Generated logs, traffic output, verification output, local telemetry data, and local artifacts are ignored by Git.
-
-For local troubleshooting:
-
-```bash
-docker compose config --quiet
-docker compose ps
-docker compose logs --since 5m checkout-api inventory-api otel-collector
-docker compose run --rm --no-deps --entrypoint /otelcol \
-  otel-collector validate --config=/etc/otelcol/config.yaml
-docker compose up --detach --wait --wait-timeout 120
-```
-
-## Native Python development
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install --requirement requirements.lock
-```
-
-Run each service from the repository root in a separate terminal:
-
-```bash
-.venv/bin/python -m uvicorn services.inventory_api.main:app --port 8001
-```
-
-```bash
-.venv/bin/python -m uvicorn services.checkout_api.main:app --port 8000
-```
-
-Supported scenarios are `normal`, `slow`, `error`, and `out-of-stock`. The `slow` and `error` scenarios are deliberately unavailable by default. To use them locally, start both services with `APP_ENV=local` and `ENABLE_LOCAL_SIMULATIONS=true`. Never enable simulated failures in a shared environment.
+The scripts use bounded polling deadlines. The Collector's explicit 256-batch sending queue is in memory: it can bridge a short backend outage while the Collector remains alive, but it cannot guarantee delivery after a Collector crash.
 
 ## Configuration
 
-| Variable | Default | Purpose |
+| Variable | Compose default | Purpose |
 | --- | --- | --- |
-| `APP_ENV` | `development` | Runtime environment; must be `local` for simulations. |
-| `INVENTORY_API_URL` | `http://127.0.0.1:8001` | Inventory service base URL used by checkout. |
-| `INVENTORY_HTTP_TIMEOUT_SECONDS` | `2.0` | Checkout-to-inventory HTTP timeout. |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | Full OTLP/HTTP endpoint used by both services for spans. |
-| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | Full OTLP/HTTP endpoint used by both services for metrics. |
-| `OTEL_TRACES_SAMPLER` | `always_on` in Compose | SDK head sampler; use `parentbased_traceidratio` for parent-aware ratio sampling. |
-| `OTEL_TRACES_SAMPLER_ARG` | empty | Sampler argument, such as `0.25` for 25% ratio sampling. |
-| `GRAFANA_ADMIN_USER` | `admin` | Local Grafana administrator name used by Compose. |
-| `GRAFANA_ADMIN_PASSWORD_FILE` | `./.local-secrets/grafana_admin_password` | Ignored local password file consumed through Grafana's secret-file setting. |
-| `ENABLE_LOCAL_SIMULATIONS` | `false` | Enables slow and error scenarios only when `APP_ENV=local`. |
-| `SIMULATED_DELAY_SECONDS` | `1.0` | Delay applied to the local slow scenario. |
+| `APP_ENV` | `local` | Runtime environment; simulations require `local`. |
+| `ENABLE_LOCAL_SIMULATIONS` | `true` | Enables slow and error scenarios in this local stack. |
+| `SIMULATED_DELAY_SECONDS` | `1.0` | Inventory delay for the slow scenario. |
+| `INVENTORY_API_URL` | `http://inventory-api:8001` | Internal checkout dependency URL. |
+| `INVENTORY_HTTP_TIMEOUT_SECONDS` | `2.0` | Checkout-to-inventory timeout. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Collector `/v1/traces` | Full OTLP/HTTP trace endpoint. |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Collector `/v1/metrics` | Full OTLP/HTTP metrics endpoint. |
+| `OTEL_TRACES_SAMPLER` | `always_on` | SDK head-sampling strategy. |
+| `OTEL_TRACES_SAMPLER_ARG` | empty | Optional ratio argument. |
+| `GRAFANA_ADMIN_USER` | `admin` | Local Grafana administrator name. |
+| `GRAFANA_ADMIN_PASSWORD_FILE` | ignored local file | Host source for the Grafana secret-file mechanism. |
 
-`.env.example` contains safe example values. The application reads environment variables directly and does not load `.env` files automatically.
+## Tests and CI
 
-## API behavior
-
-- `POST /check` returns `200` with `available: true` or `false`; unknown products return `404`.
-- `POST /checkout` returns `200` when inventory is available and `409` when it is not.
-- Invalid request bodies return `422`, upstream connection problems return `502`, unavailable inventory returns `503`, and inventory timeouts return `504`.
-
-## Tests
+Run local code checks:
 
 ```bash
+.venv/bin/python -m compileall -q services shared scripts tests
 .venv/bin/python -m pytest
+.venv/bin/python -m pip check
+docker compose config --quiet
+docker compose run --rm --no-deps --entrypoint /otelcol \
+  otel-collector validate --config=/etc/otelcol/config.yaml
 ```
 
-The tests exercise validation, deterministic inventory behavior, local-only simulations, service-to-service calls, error mapping, timeout handling, HTTP client shutdown, telemetry lifecycle, parent-child relationships, exception recording, bounded metric measurements, structured log correlation, and context cleanup.
+The GitHub Actions workflow has read-only repository permissions. It installs locked dependencies, compiles Python, runs tests, validates Compose and the pinned Collector configuration, builds both application images, starts the stack, executes `scripts/verify_stack.py`, and always stops project containers. The workflow requires no repository secrets and does not deploy or publish artifacts.
+
+## Shutdown and data reset
+
+Normal shutdown removes this project's containers and networks while preserving named volumes:
+
+```bash
+docker compose down --remove-orphans
+```
+
+The following command is intentionally destructive. It deletes this Compose project's Prometheus data, Grafana database, and prepared Grafana-secret volume:
+
+```bash
+docker compose down --volumes --remove-orphans
+```
+
+It does not prune global Docker resources. Jaeger traces are already transient and disappear when Jaeger stops.
+
+## Troubleshooting
+
+- **Docker daemon unavailable:** run `sudo systemctl enable --now docker`, then verify with `docker version`.
+- **Grafana rejects the generated password:** the admin password is applied when Grafana initializes its database. If the password was missing or unreadable on first start, run the destructive project-data reset, regenerate the password file, and start again.
+- **No metrics immediately after a request:** application metrics export every five seconds and Prometheus scrapes every two seconds. Generate traffic and use `scripts/verify_stack.py` instead of relying on a fixed sleep.
+- **No trace during ratio sampling:** head sampling is probabilistic. Restore `OTEL_TRACES_SAMPLER=always_on` when every local trace is required.
+- **Fedora bind-mount denial:** keep the repository's `:Z` labels and inspect SELinux audit output; do not disable SELinux.
+- **Port already in use:** inspect local listeners on `8000`, `3000`, `9090`, and `16686` before changing published ports.
+
+## Limitations
+
+- Local telemetry uses plaintext inside an isolated development network; there is no TLS or service-to-service authentication.
+- Inventory is a fixed in-memory catalog, stock is not decremented, and there is no real payment integration or database.
+- Jaeger uses in-memory storage. Prometheus and Grafana persist only in local Docker volumes.
+- Logs are correlated stdout records without durable storage or an OTLP log pipeline.
+- Collector and SDK queues are memory-only and do not provide crash-safe delivery.
+- The Collector Prometheus exporter and Python instrumentation packages used here are pre-stable components.
+- There is no high availability, alerting, tail-sampling deployment, production capacity claim, Kubernetes, or cloud deployment.
+
+## Official documentation
+
+- [Docker Engine on Fedora](https://docs.docker.com/engine/install/fedora/)
+- [Docker Compose installation](https://docs.docker.com/compose/install/)
+- [OpenTelemetry Python exporters](https://opentelemetry.io/docs/languages/python/exporters/)
+- [OpenTelemetry Collector configuration](https://opentelemetry.io/docs/collector/configuration/)
+- [OpenTelemetry SDK sampling configuration](https://opentelemetry.io/docs/languages/sdk-configuration/general/)
+- [Jaeger 2.22 documentation](https://www.jaegertracing.io/docs/2.22/)
+- [Prometheus installation](https://prometheus.io/docs/prometheus/latest/installation/)
+- [Grafana Docker configuration and secret files](https://grafana.com/docs/grafana/latest/setup-grafana/configure-docker/)
+- [Grafana provisioning](https://grafana.com/docs/grafana/latest/administration/provisioning/)

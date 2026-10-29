@@ -110,6 +110,24 @@ def validate_connected_trace(trace_data: dict[str, Any]) -> None:
         )
 
 
+def complete_checkout_trace(
+    jaeger_url: str, trace_id: str
+) -> dict[str, Any] | None:
+    trace_data = jaeger_trace(jaeger_url, trace_id)
+    if trace_data is None:
+        return None
+    expected_names = {
+        "POST /checkout",
+        "checkout.process",
+        "POST",
+        "POST /check",
+        "inventory.lookup",
+    }
+    if {span["operationName"] for span in trace_data["spans"]} != expected_names:
+        return None
+    return trace_data
+
+
 def verify(args: argparse.Namespace) -> None:
     compose_command = parse_compose_command(args.compose_command)
     checkout_url = require_local_http_url(args.checkout_url)
@@ -158,15 +176,47 @@ def verify(args: argparse.Namespace) -> None:
         "inventory health contract",
     )
 
-    warmup_status, _ = request_json(
-        f"{checkout_url}/checkout",
-        method="POST",
-        payload={"product_id": "SKU-001", "quantity": 2, "scenario": "normal"},
-    )
-    check(warmup_status == 200, "metrics warm-up request succeeds")
+    previous_total = prometheus_value(prometheus_url, "sum(checkout_requests_total)")
+    for scenario, expected_status in (
+        ("normal", 200),
+        ("error", 503),
+        ("out-of-stock", 409),
+    ):
+        status, _ = request_json(
+            f"{checkout_url}/checkout",
+            method="POST",
+            payload={
+                "product_id": "SKU-001",
+                "quantity": 2,
+                "scenario": scenario,
+            },
+        )
+        check(status == expected_status, f"{scenario} metrics warm-up request")
+
+    def current_process_metrics() -> float | None:
+        current_total = prometheus_value(
+            prometheus_url, "sum(checkout_requests_total)"
+        )
+        if current_total is None:
+            return None
+        if previous_total is not None and current_total == previous_total:
+            status, _ = request_json(
+                f"{checkout_url}/checkout",
+                method="POST",
+                payload={
+                    "product_id": "SKU-001",
+                    "quantity": 2,
+                    "scenario": "normal",
+                },
+            )
+            if status != 200:
+                raise RuntimeError("metrics warm-up probe did not return 200")
+            return None
+        return current_total
+
     baseline_total = poll(
-        "warm-up metric",
-        lambda: prometheus_value(prometheus_url, "sum(checkout_requests_total)"),
+        "current-process metric samples",
+        current_process_metrics,
         deadline_seconds=args.deadline,
     )
     baseline_outcomes = {
@@ -246,18 +296,53 @@ def verify(args: argparse.Namespace) -> None:
         histogram_sum >= baseline_histogram_sum + 0.75,
         "histogram sum reflects slow-request seconds",
     )
-    request_rate = prometheus_value(
-        prometheus_url, "sum(rate(checkout_requests_total[1m]))"
-    )
-    error_ratio = prometheus_value(
-        prometheus_url,
-        'sum(rate(checkout_requests_total{result="error"}[1m])) / '
-        "sum(rate(checkout_requests_total[1m]))",
-    )
-    latency_p95 = prometheus_value(
-        prometheus_url,
-        "histogram_quantile(0.95, sum by (le) "
-        "(rate(checkout_request_duration_seconds_bucket[1m])))",
+    # A newly created Prometheus label series needs a scraped baseline followed by
+    # another increment before rate() can observe a non-zero change. The checks
+    # above establish that baseline; this bounded mixed probe creates the second
+    # sample needed to verify the dashboard's rate-based queries from a fresh
+    # Prometheus volume.
+    for scenario, expected_status in (("normal", 200), ("error", 503)):
+        status, _ = request_json(
+            f"{checkout_url}/checkout",
+            method="POST",
+            payload={
+                "product_id": "SKU-001",
+                "quantity": 2,
+                "scenario": scenario,
+            },
+        )
+        check(status == expected_status, f"{scenario} dashboard-query probe")
+
+    def dashboard_query_values() -> tuple[float, float, float] | None:
+        request_rate = prometheus_value(
+            prometheus_url, "sum(rate(checkout_requests_total[1m]))"
+        )
+        error_ratio = prometheus_value(
+            prometheus_url,
+            'sum(rate(checkout_requests_total{result="error"}[1m])) / '
+            "sum(rate(checkout_requests_total[1m]))",
+        )
+        latency_p95 = prometheus_value(
+            prometheus_url,
+            "histogram_quantile(0.95, sum by (le) "
+            "(rate(checkout_request_duration_seconds_bucket[1m])))",
+        )
+        if (
+            request_rate is not None
+            and request_rate > 0
+            and error_ratio is not None
+            and 0 < error_ratio < 1
+            and latency_p95 is not None
+            and math.isfinite(latency_p95)
+            and latency_p95 > 0
+        ):
+            return request_rate, error_ratio, latency_p95
+        return None
+
+    request_rate, error_ratio, latency_p95 = poll(
+        "rate-based Prometheus dashboard queries",
+        dashboard_query_values,
+        deadline_seconds=args.deadline,
     )
     check(request_rate is not None and request_rate > 0, "request-rate query returns data")
     check(
@@ -294,7 +379,7 @@ def verify(args: argparse.Namespace) -> None:
 
     error_trace = poll(
         "error trace in Jaeger",
-        lambda: jaeger_trace(jaeger_url, str(error_log["trace_id"])),
+        lambda: complete_checkout_trace(jaeger_url, str(error_log["trace_id"])),
         deadline_seconds=args.deadline,
     )
     validate_connected_trace(error_trace)
@@ -316,7 +401,7 @@ def verify(args: argparse.Namespace) -> None:
 
     slow_trace = poll(
         "slow trace in Jaeger",
-        lambda: jaeger_trace(jaeger_url, str(slow_log["trace_id"])),
+        lambda: complete_checkout_trace(jaeger_url, str(slow_log["trace_id"])),
         deadline_seconds=args.deadline,
     )
     slow_lookup = span_by_name(slow_trace, "inventory.lookup")
